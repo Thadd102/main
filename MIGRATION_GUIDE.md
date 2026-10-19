@@ -153,8 +153,8 @@ cargo test --lib
 | Scenario | Rollback Action |
 |----------|----------------|
 | v2 proof verification fails | Switch verifier back to the v1 verifier contract |
-| Epoch rotation causes legitimate failures | Admin may restore the previous epoch via `set_scope_epoch`; assess whether old proofs would become valid again |
-| Scope configuration error | Admin may set the epoch to 0, but the storage entry remains and old proofs may become valid again |
+| Epoch rotation causes legitimate failures | Epochs are strictly monotonic; rolling back via `set_scope_epoch` is rejected with `StaleEpoch` to preserve nullifier replay security |
+| Scope configuration error | Epochs cannot be rolled back or reset to 0; configure a new scope identifier if clean state is required |
 | Contract bug in v2 path | Deploy a patched contract and redirect verifier |
 
 ### 5.2 Rollback Procedure

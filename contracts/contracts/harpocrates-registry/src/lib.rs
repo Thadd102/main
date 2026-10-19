@@ -2725,6 +2725,12 @@ impl HarpocratesRegistry {
     /// under the previous epoch for that scope will have stale epoch values
     /// and will be rejected by `register_anonymous_verified`.
     ///
+    /// Epochs are strictly monotonic (`epoch > current`). Setting an epoch
+    /// less than or equal to the current epoch panics with `RegistryError::StaleEpoch`
+    /// to prevent epoch rollback and re-enabling previously consumed nullifiers.
+    /// Non-increasing transitions (including equal) are rejected rather than
+    /// treated idempotently to ensure every update explicitly advances the epoch.
+    ///
     /// The scope is a 32-byte identifier derived from the scope string
     /// (e.g., SHA-256 hash mod BN254 field).  An empty (zero) scope
     /// represents the global/unscoped context.
@@ -2732,6 +2738,12 @@ impl HarpocratesRegistry {
     /// Only the registry admin may call this.
     pub fn set_scope_epoch(env: Env, admin: Address, scope: BytesN<32>, epoch: u64) {
         require_admin(&env, &admin);
+
+        let current_epoch = get_scope_epoch_raw(&env, &scope);
+        if epoch <= current_epoch {
+            panic_with_error!(&env, RegistryError::StaleEpoch);
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::ScopeEpoch(scope.clone()), &epoch);
