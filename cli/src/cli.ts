@@ -3,9 +3,11 @@
 import { createReadStream } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+import { resolve } from 'node:path'
 import process from 'node:process'
 import { StrKey } from '@stellar/stellar-sdk'
-import { createProofManifest, parseManifest, serializeManifest } from './manifest.js'
+import { createProofManifest, parseManifest, serializeManifest, MAX_MANIFEST_BYTES } from './manifest.js'
 import { validateMetadata, fileHash, canonicalMetadataHash, type HarpocratesMetadata } from './metadata.js'
 import { lookupByVideoHash, verifyTransaction, getLineage, getProofStatus } from './stellar-lookup.js'
 import { createReceipt, formatReceipt, type VerificationReceipt } from './receipt.js'
@@ -24,14 +26,24 @@ import { parseCliArgs, CliUsageError, type ParsedArgs } from './args.js'
 
 // ── I/O helpers ───────────────────────────────────────────────────────────
 
-async function readText(path: string): Promise<string> {
+export async function readText(
+  source: string | NodeJS.ReadableStream,
+  limit: number = MAX_MANIFEST_BYTES,
+): Promise<string> {
   const chunks: Buffer[] = []
   let size = 0
-  const source = path === '-' ? process.stdin : createReadStream(path)
-  for await (const chunk of source) {
+  const stream: NodeJS.ReadableStream =
+    typeof source !== 'string'
+      ? source
+      : source === '-'
+        ? process.stdin
+        : createReadStream(source)
+  for await (const chunk of stream) {
     size += Buffer.byteLength(chunk)
-    if (size > 1024 * 1024) {
-      if (path !== '-') source.destroy()
+    if (size > limit) {
+      if (typeof (stream as unknown as { destroy?: () => void }).destroy === 'function') {
+        (stream as unknown as { destroy: () => void }).destroy()
+      }
       throw new Error('input exceeds 1 MiB limit')
     }
     chunks.push(Buffer.from(chunk))
@@ -445,8 +457,8 @@ async function handleVerifyLineage(
   exit(0)
 }
 
-function printHelp(): void {
-  const help = `
+export function helpText(): string {
+  return `
 Harpocrates CLI – headless verification and proof utilities
 
 Usage:
@@ -527,9 +539,11 @@ Exit codes:
   6   pending
   7   failed
   8   error
-`
-  printText(help.trim())
+`.trim()
+}
 
+function printHelp(): void {
+  printText(helpText())
   process.exit(0)
 }
 
@@ -539,8 +553,20 @@ function printUnknownCommand(name: string): never {
   process.exit(2)
 }
 
-main().catch((err) => {
-  void err
-  process.stderr.write('harpocrates: unexpected error\n')
-  process.exit(8)
-})
+export { main }
+
+const isDirectExecution =
+  process.argv[1] &&
+  (resolve(process.argv[1]) === fileURLToPath(import.meta.url) ||
+   resolve(process.argv[1]).replace(/\.ts$/, '.js') === fileURLToPath(import.meta.url).replace(/\.ts$/, '.js') ||
+   process.argv[1].endsWith('cli.js') ||
+   process.argv[1].endsWith('cli.ts') ||
+   process.argv[1].endsWith('harpocrates'))
+
+if (isDirectExecution) {
+  main().catch((err) => {
+    void err
+    process.stderr.write('harpocrates: unexpected error\n')
+    process.exit(8)
+  })
+}

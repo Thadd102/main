@@ -1,4 +1,4 @@
-import { BASE_FEE, Contract, Networks, StrKey, TransactionBuilder, rpc, scValToNative, nativeToScVal } from '@stellar/stellar-sdk'
+import { BASE_FEE, Contract, Networks, StrKey, TransactionBuilder, rpc, scValToNative, nativeToScVal, xdr } from '@stellar/stellar-sdk'
 import { asHex32, bytesToHex, hexToBytes } from './hashing.js'
 
 /**
@@ -184,7 +184,7 @@ export async function getOpenDisputeCount(
 async function simulateRead(
   contractId: string,
   method: string,
-  args: unknown[],
+  args: xdr.ScVal[],
   options: StellarLookupOptions,
 ): Promise<any> {
   const rpcUrl = options.rpcUrl ?? DEFAULT_RPC_URL

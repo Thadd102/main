@@ -63,7 +63,11 @@ validation still applies to environment values.
 
 The CLI accepts at most 1 MiB of manifest/metadata JSON. It rejects unknown
 manifest fields and unsupported versions, and writes fixed, privacy-safe
-error messages rather than raw RPC or file errors. Do not pass private
+error messages rather than raw RPC or file errors. Standard input manifest
+reads (`--manifest -`) stream input bounded by this 1 MiB limit, destroying
+the stream and aborting before JSON parsing if the bound is exceeded. Callers
+expecting JSON output (`--output json`) receive clean standard output on error,
+with failure messages routed exclusively to standard error. Do not pass private
 witnesses, seeds, credentials, media, or secrets in a manifest. The receipt
 contains only public manifest and registry fields, but hashes and addresses
 can still be sensitive in context; restrict receipt access accordingly.
