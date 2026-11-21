@@ -7,6 +7,8 @@ import { EventList } from '../components/EventList'
 import { ShareVerificationLink } from '../components/ShareVerificationLink'
 import { VerifierSetStatusPanel } from '../components/VerifierSetStatusPanel'
 import VerificationTimeline from '../components/VerificationTimeline'
+import { VerificationDetailExplorer } from '../components/VerificationDetailExplorer'
+import { buildVerificationDetails } from '../services/verificationFlow'
 import { shortHash } from '../utils'
 import ProvenanceCard from '../provenance/ProvenanceCard'
 import type { ProvenanceRecord } from '../provenance/provenanceModel'
@@ -150,6 +152,36 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
       tier,
     }
   }, [status, videoHashInput, verifyHash, events, proofIdInput, chainProof, provenanceRecord])
+
+  const verificationDetails = useMemo(() => {
+    const activeHash = videoHashInput || verifyHash
+    return buildVerificationDetails({
+      videoHash: activeHash,
+      hasHarpocratesMetadata:
+        offline
+          ? status === 'success' && !errorCode
+          : status === 'success' || events.length > 0,
+      events,
+      onChain: chainProof,
+      proofId: proofIdInput || revocationProofId,
+      tier: shareLinkInput?.tier,
+      metadataHash: chainProof?.metadataHash || provenanceRecord?.metadata.metadataHash || null,
+      offline,
+      errorCode,
+    })
+  }, [
+    videoHashInput,
+    verifyHash,
+    offline,
+    status,
+    errorCode,
+    events,
+    chainProof,
+    proofIdInput,
+    revocationProofId,
+    shareLinkInput?.tier,
+    provenanceRecord?.metadata.metadataHash,
+  ])
 
   return (
     <section className="workspace app-page verify-page" id="verify">
@@ -442,6 +474,8 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
         ) : (
           <ShareVerificationLink input={shareLinkInput} />
         )}
+
+        <VerificationDetailExplorer details={verificationDetails} />
 
         <dl className="data-list">
           <div>

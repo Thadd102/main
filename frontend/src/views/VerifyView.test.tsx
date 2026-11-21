@@ -421,3 +421,83 @@ describe('VerifyView – portable proof manifest loading', () => {
     })
   })
 })
+
+// ─── Verification Detail Explorer ──────────────────────────────────────────
+
+describe('VerifyView – verification detail explorer', () => {
+  it('renders the verification detail explorer with meaningful headings and 3 expandable sections', () => {
+    renderView()
+
+    expect(screen.getByRole('heading', { level: 3, name: /verification detail explorer/i })).toBeInTheDocument()
+
+    const sectionButtons = [
+      screen.getByRole('button', { name: /public-input checks/i }),
+      screen.getByRole('button', { name: /chain observations/i }),
+      screen.getByRole('button', { name: /trust reasons/i }),
+    ]
+
+    for (const btn of sectionButtons) {
+      expect(btn).toBeInTheDocument()
+      expect(btn).toHaveAttribute('aria-expanded', 'true')
+      expect(btn).toHaveAttribute('aria-controls')
+    }
+  })
+
+  it('exposes public inputs, chain observations, and trust reasons for confirmed proof', () => {
+    const validHash = 'a'.repeat(64)
+    const mockChainProof = {
+      videoHash: validHash,
+      metadataHash: 'b'.repeat(64),
+      status: 1,
+      tier: 1,
+      createdAt: '1700000000',
+      expiresAt: 0,
+      issuer: 'GBISSUER123',
+      source: 'GBSOURCE123',
+    }
+    const mockEvent = {
+      id: 1,
+      event_type: 'registered',
+      file_name: 'test.mp4',
+      video_hash: validHash,
+      proof_id: '0x' + 'c'.repeat(64),
+      tier: 'silent',
+      created_at: '2026-10-19T00:00:00Z',
+    }
+
+    renderView({
+      status: 'success',
+      verifyHash: validHash,
+      chainProof: mockChainProof,
+      events: [mockEvent],
+    })
+
+    expect(screen.getByText('Video Hash Encoding')).toBeInTheDocument()
+    expect(screen.getByText(/canonical 32-byte sha-256 evidence fingerprint/i)).toBeInTheDocument()
+    expect(screen.getByText('Registry Status')).toBeInTheDocument()
+    expect(screen.getByText('Confirmed (Active)')).toBeInTheDocument()
+    expect(screen.getByText('Full Corroboration Confirmed')).toBeInTheDocument()
+  })
+
+  it('reflects offline boundary mode in detail explorer', () => {
+    renderView({
+      offline: true,
+      verifyHash: 'd'.repeat(64),
+    })
+
+    expect(screen.getByText('Not checked (offline mode)')).toBeInTheDocument()
+    expect(screen.getByText('Not queried (offline mode)')).toBeInTheDocument()
+    expect(screen.getByText('Local Inspection Only')).toBeInTheDocument()
+  })
+
+  it('allows keyboard toggling of detail sections', async () => {
+    const user = userEvent.setup()
+    renderView()
+
+    const publicBtn = screen.getByRole('button', { name: /public-input checks/i })
+    expect(publicBtn).toHaveAttribute('aria-expanded', 'true')
+
+    await user.click(publicBtn)
+    expect(publicBtn).toHaveAttribute('aria-expanded', 'false')
+  })
+})
