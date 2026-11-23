@@ -2,10 +2,13 @@
  * verificationFlow — orchestrates the verification portal flow.
  *
  * Responsibility: combine the Flask extraction, NeonDB lookup, and the
- * Soroban on-chain registry into a single result. No React state.
+ * Soroban on-chain registry into a single structured result with independent
+ * trust dimensions, and bind cached verification results to their statement
+ * and trust snapshot identity so incompatible context changes require a fresh
+ * explicit verification result. No React state.
  */
 
-import type { ChainProofRecord } from '../stellarTypes'
+import type { ChainProofRecord, IssuerRecord } from '../stellarTypes'
 import type { ProofEvent } from '../types'
 import { assertValidVideoHash } from './videoHash'
 import {
@@ -14,48 +17,51 @@ import {
   getOnChainProof,
 } from './verificationService'
 
-export type VerificationCheckStatus = 'passed' | 'failed' | 'warning' | 'info'
+export type TrustDimensionKey =
+  | 'contentIntegrity'
+  | 'chainRegistration'
+  | 'issuerTrust'
+  | 'freshness'
 
-export type PublicInputCheck = {
-  id: string
-  name: string
-  status: VerificationCheckStatus
-  summary: string
-  value?: string | null
-  detail?: string
-}
+export type TrustDimensionState =
+  | 'verified'
+  | 'failed'
+  | 'unverified'
+  | 'not_applicable'
 
-export type ChainObservation = {
-  id: string
+export type TrustDimensionResult = {
+  key: TrustDimensionKey
   label: string
-  value: string
-  status?: VerificationCheckStatus
-  detail?: string
+  state: TrustDimensionState
+  code: string
+  summary: string
 }
 
-export type TrustReason = {
-  id: string
-  title: string
-  status: VerificationCheckStatus
-  description: string
+export type TrustDimensions = {
+  contentIntegrity: TrustDimensionResult
+  chainRegistration: TrustDimensionResult
+  issuerTrust: TrustDimensionResult
+  freshness: TrustDimensionResult
 }
 
-export type VerificationDetails = {
-  publicInputChecks: PublicInputCheck[]
-  chainObservations: ChainObservation[]
-  trustReasons: TrustReason[]
+export type OverallTrustVerdict = 'verified' | 'failed' | 'incomplete'
+
+export type StructuredVerificationModel = {
+  overall: OverallTrustVerdict
+  hasFailure: boolean
+  failedDimensions: TrustDimensionKey[]
+  dimensions: TrustDimensions
 }
 
-export type VerificationDetailOptions = {
-  videoHash: string
-  hasHarpocratesMetadata?: boolean
+export type VerificationDimensionsInput = {
+  hasHarpocratesMetadata?: boolean | null
+  metadataEnvelopeMismatch?: boolean
+  onChain: ChainProofRecord | null
   events?: ProofEvent[]
-  onChain?: ChainProofRecord | null
-  proofId?: string | null
-  tier?: string | null
-  metadataHash?: string | null
+  issuerRecord?: IssuerRecord | null
   offline?: boolean
   errorCode?: string | null
+  nowUnixSeconds?: number
 }
 
 export type VerificationResult = {
@@ -63,357 +69,450 @@ export type VerificationResult = {
   hasHarpocratesMetadata: boolean
   events: ProofEvent[]
   onChain: ChainProofRecord | null
-  publicInputChecks: PublicInputCheck[]
-  chainObservations: ChainObservation[]
-  trustReasons: TrustReason[]
-  details: VerificationDetails
+  trust: StructuredVerificationModel
 }
 
-function formatProofExpiry(expiresAt: number | null | undefined): string {
-  if (expiresAt === 0) return 'Never'
-  if (expiresAt === null || expiresAt === undefined || !Number.isSafeInteger(expiresAt) || expiresAt < 0) {
-    return 'Unavailable'
-  }
-  const milliseconds = expiresAt * 1000
-  if (!Number.isFinite(milliseconds)) return 'Unavailable'
-  const date = new Date(milliseconds)
-  return Number.isNaN(date.getTime()) ? 'Unavailable' : date.toISOString()
+export type VerificationStatementIdentity = {
+  videoHash: string
+  proofId?: string | null
+  metadataHash?: string | null
 }
 
-function formatIdentityTier(tier: unknown): string {
-  if (tier === 1 || tier === '1' || tier === 'silent') return 'Silent (Tier 1)'
-  if (tier === 2 || tier === '2' || tier === 'source') return 'Consistent Source (Tier 2)'
-  if (tier === 3 || tier === '3' || tier === 'seal') return 'Institutional Seal (Tier 3)'
-  if (tier !== null && tier !== undefined && tier !== '') return String(tier)
-  return 'Unavailable'
+export type TrustSnapshotIdentity = {
+  network: string
+  contractId: string
+  offline: boolean
+  networkMismatch?: string | null
 }
 
-function isValidHexHash(value: string | null | undefined): boolean {
-  if (!value) return false
-  return /^[0-9a-fA-F]{64}$/.test(value.trim())
+export type VerificationContextIdentity = {
+  statement: VerificationStatementIdentity
+  trustSnapshot: TrustSnapshotIdentity
+}
+
+export type CachedVerificationEntry<T = VerificationResult> = {
+  contextKey: string
+  context: VerificationContextIdentity
+  result: T
+}
+
+export type StaleVerificationReason =
+  | 'MISSING_CACHE'
+  | 'NETWORK_MISMATCH'
+  | 'CONTEXT_CHANGED'
+
+export type CachedVerificationResolution<T = VerificationResult> =
+  | { usable: true; result: T }
+  | { usable: false; reason: StaleVerificationReason }
+
+function normalizeDigest(value: string | null | undefined): string {
+  if (typeof value !== 'string') return ''
+  return value.trim().toLowerCase()
+}
+
+function normalizeText(value: string | null | undefined): string {
+  if (typeof value !== 'string') return ''
+  return value.trim()
 }
 
 /**
- * Builds the structured verification detail explorer model covering public-input checks,
- * chain observations, and trust reasons.
+ * Build a canonical key binding a verification result to both the statement
+ * identity (videoHash, proofId, metadataHash) and the trust snapshot identity
+ * (network, contractId, offline mode, networkMismatch).
  */
-export function buildVerificationDetails({
-  videoHash,
-  hasHarpocratesMetadata = false,
-  events = [],
-  onChain = null,
-  proofId = null,
-  tier = null,
-  metadataHash = null,
-  offline = false,
-  errorCode = null,
-}: VerificationDetailOptions): VerificationDetails {
-  const trimmedHash = (videoHash || '').trim()
-  const isHashValid = isValidHexHash(trimmedHash)
-  const resolvedProofId =
-    proofId ||
-    onChain?.proofId ||
-    events.find((e) => e.video_hash === trimmedHash && e.proof_id)?.proof_id ||
-    events.find((e) => e.proof_id)?.proof_id ||
-    null
-
-  const resolvedTier = onChain?.tier !== undefined ? onChain.tier : tier
-
-  // 1. Public-Input Checks
-  const publicInputChecks: PublicInputCheck[] = []
-
-  // Video hash format check
-  if (!trimmedHash) {
-    publicInputChecks.push({
-      id: 'video-hash',
-      name: 'Video Hash Encoding',
-      status: 'failed',
-      summary: 'Evidence fingerprint is missing or empty',
-      value: null,
-      detail: 'A canonical 64-character SHA-256 hash is required.',
-    })
-  } else if (isHashValid) {
-    publicInputChecks.push({
-      id: 'video-hash',
-      name: 'Video Hash Encoding',
-      status: 'passed',
-      summary: 'Canonical 32-byte SHA-256 evidence fingerprint',
-      value: trimmedHash,
-      detail: 'The artifact hash is properly formatted as a 64-character lowercase hex string.',
-    })
-  } else {
-    publicInputChecks.push({
-      id: 'video-hash',
-      name: 'Video Hash Encoding',
-      status: 'failed',
-      summary: 'Malformed evidence fingerprint',
-      value: trimmedHash,
-      detail: 'Fingerprint must be exactly 64 hexadecimal characters (32 bytes).',
-    })
-  }
-
-  // Metadata envelope check
-  publicInputChecks.push({
-    id: 'metadata-envelope',
-    name: 'Harpocrates Metadata Envelope',
-    status: hasHarpocratesMetadata ? 'passed' : 'warning',
-    summary: hasHarpocratesMetadata
-      ? 'Embedded Harpocrates metadata envelope detected'
-      : 'No embedded Harpocrates metadata detected in artifact',
-    detail: hasHarpocratesMetadata
-      ? 'Artifact carries valid embedded steganographic envelope header and parameters.'
-      : 'The artifact lacks embedded Harpocrates steganography metadata.',
+export function buildVerificationContextKey(
+  context: VerificationContextIdentity,
+): string {
+  return JSON.stringify({
+    statement: {
+      videoHash: normalizeDigest(context.statement.videoHash),
+      proofId: normalizeDigest(context.statement.proofId),
+      metadataHash: normalizeDigest(context.statement.metadataHash),
+    },
+    trustSnapshot: {
+      network: normalizeText(context.trustSnapshot.network),
+      contractId: normalizeText(context.trustSnapshot.contractId),
+      offline: Boolean(context.trustSnapshot.offline),
+      networkMismatch: normalizeText(context.trustSnapshot.networkMismatch),
+    },
   })
+}
 
-  // Proof ID input check
-  publicInputChecks.push({
-    id: 'proof-id',
-    name: 'Proof Identifier',
-    status: resolvedProofId ? 'passed' : 'info',
-    summary: resolvedProofId ? 'Proof identifier bound to verification session' : 'No proof identifier declared',
-    value: resolvedProofId,
-    detail: resolvedProofId
-      ? 'Associated zero-knowledge proof record ID located for verification.'
-      : 'Verification proceeded with video hash lookup only.',
-  })
-
-  // Metadata binding check
-  const onChainMeta = onChain?.metadataHash
-  if (metadataHash && onChainMeta) {
-    const matches = metadataHash.trim().toLowerCase() === onChainMeta.trim().toLowerCase()
-    publicInputChecks.push({
-      id: 'metadata-binding',
-      name: 'Metadata Hash Commitment Binding',
-      status: matches ? 'passed' : 'failed',
-      summary: matches
-        ? 'Embedded metadata hash matches on-chain commitment'
-        : 'Metadata mismatch: embedded hash does not match on-chain record',
-      value: metadataHash,
-      detail: matches
-        ? 'Cryptographic binding between embedded metadata and smart contract registry is intact.'
-        : 'Possible tampering: the extracted metadata hash differs from the registry commitment.',
-    })
-  } else if (onChainMeta) {
-    publicInputChecks.push({
-      id: 'metadata-binding',
-      name: 'Metadata Hash Commitment Binding',
-      status: 'info',
-      summary: 'On-chain metadata commitment recorded',
-      value: onChainMeta,
-      detail: 'Registry holds a metadata commitment for this proof.',
-    })
-  } else if (metadataHash) {
-    publicInputChecks.push({
-      id: 'metadata-binding',
-      name: 'Metadata Hash Commitment Binding',
-      status: 'info',
-      summary: 'Embedded metadata hash extracted',
-      value: metadataHash,
-      detail: 'Extracted metadata hash pending on-chain envelope comparison.',
-    })
-  } else {
-    publicInputChecks.push({
-      id: 'metadata-binding',
-      name: 'Metadata Hash Commitment Binding',
-      status: 'info',
-      summary: 'No metadata hash commitment available',
-      value: null,
-      detail: 'No on-chain or extracted metadata hash was provided for comparison.',
-    })
+/**
+ * Return true only when a cached verification result was produced for the same
+ * statement and trust snapshot identity without an active network mismatch.
+ */
+export function isVerificationContextCompatible(
+  cached: VerificationContextIdentity,
+  current: VerificationContextIdentity,
+): boolean {
+  if (
+    normalizeText(cached.trustSnapshot.networkMismatch) ||
+    normalizeText(current.trustSnapshot.networkMismatch)
+  ) {
+    return false
   }
+  if (!normalizeDigest(current.statement.videoHash)) {
+    return false
+  }
+  return buildVerificationContextKey(cached) === buildVerificationContextKey(current)
+}
 
-  // 2. Chain Observations
-  const chainObservations: ChainObservation[] = []
+/**
+ * Bind a verification result to its statement and trust snapshot identity.
+ */
+export function createCachedVerificationEntry<T = VerificationResult>(
+  context: VerificationContextIdentity,
+  result: T,
+): CachedVerificationEntry<T> {
+  return {
+    contextKey: buildVerificationContextKey(context),
+    context,
+    result,
+  }
+}
 
-  let chainStatusValue = 'No record on-chain'
-  let chainStatusType: VerificationCheckStatus = 'warning'
-  let chainStatusDetail = 'The Stellar registry has no record for this video hash.'
+/**
+ * Resolve whether a cached verification result can be displayed for the
+ * current context, or whether an incompatible context change requires a fresh
+ * explicit verification result.
+ */
+export function resolveCachedVerificationResult<T = VerificationResult>(
+  entry: CachedVerificationEntry<T> | null,
+  currentContext: VerificationContextIdentity,
+): CachedVerificationResolution<T> {
+  if (!entry) {
+    return { usable: false, reason: 'MISSING_CACHE' }
+  }
+  if (normalizeText(currentContext.trustSnapshot.networkMismatch)) {
+    return { usable: false, reason: 'NETWORK_MISMATCH' }
+  }
+  const currentKey = buildVerificationContextKey(currentContext)
+  if (
+    entry.contextKey !== currentKey ||
+    !isVerificationContextCompatible(entry.context, currentContext)
+  ) {
+    return { usable: false, reason: 'CONTEXT_CHANGED' }
+  }
+  return { usable: true, result: entry.result }
+}
 
-  if (offline) {
-    chainStatusValue = 'Not checked (offline mode)'
-    chainStatusType = 'info'
-    chainStatusDetail = 'Verification ran in local mode with zero network calls.'
-  } else if (onChain) {
-    if (onChain.status === 2) {
-      chainStatusValue = 'Revoked'
-      chainStatusType = 'failed'
-      chainStatusDetail = 'The proof record has been marked REVOKED in the registry.'
-    } else if (onChain.status === 3) {
-      chainStatusValue = 'Expired'
-      chainStatusType = 'failed'
-      chainStatusDetail = 'The validity period for this record on-chain has lapsed.'
-    } else {
-      chainStatusValue = 'Confirmed (Active)'
-      chainStatusType = 'passed'
-      chainStatusDetail = 'Active and confirmed proof record found on-chain.'
+const CONTENT_FAILURE_CODES = new Set([
+  'EMPTY_INPUT',
+  'UNSUPPORTED_ARTIFACT',
+  'OVERSIZED_ARTIFACT',
+  'INVALID_EVIDENCE',
+])
+
+const CHAIN_FAILURE_CODES = new Set([
+  'DEPENDENCY_UNAVAILABLE',
+  'TIMEOUT',
+  'VERIFICATION_FAILED',
+  'WALLET_UNAVAILABLE',
+])
+
+/**
+ * Evaluate each verification trust dimension independently so a successful
+ * dimension can never mask another dimension's failure.
+ */
+export function buildVerificationDimensions(
+  input: VerificationDimensionsInput,
+): StructuredVerificationModel {
+  const {
+    hasHarpocratesMetadata = null,
+    metadataEnvelopeMismatch = false,
+    onChain,
+    issuerRecord,
+    offline = false,
+    errorCode = null,
+    nowUnixSeconds = Math.floor(Date.now() / 1000),
+  } = input
+
+  // 1. Content integrity
+  let contentIntegrity: TrustDimensionResult
+  if (metadataEnvelopeMismatch || errorCode === 'METADATA_ENVELOPE_MISMATCH') {
+    contentIntegrity = {
+      key: 'contentIntegrity',
+      label: 'Content Integrity',
+      state: 'failed',
+      code: 'METADATA_ENVELOPE_MISMATCH',
+      summary: 'Embedded metadata hash does not match the on-chain envelope.',
+    }
+  } else if (errorCode && CONTENT_FAILURE_CODES.has(errorCode)) {
+    contentIntegrity = {
+      key: 'contentIntegrity',
+      label: 'Content Integrity',
+      state: 'failed',
+      code: errorCode,
+      summary: 'Artifact failed content validation or metadata extraction.',
+    }
+  } else if (hasHarpocratesMetadata === true) {
+    contentIntegrity = {
+      key: 'contentIntegrity',
+      label: 'Content Integrity',
+      state: 'verified',
+      code: 'METADATA_CONFIRMED',
+      summary: 'Embedded Harpocrates metadata was extracted and validated.',
+    }
+  } else {
+    contentIntegrity = {
+      key: 'contentIntegrity',
+      label: 'Content Integrity',
+      state: 'unverified',
+      code: 'METADATA_ABSENT',
+      summary: 'No valid embedded Harpocrates metadata was confirmed for this artifact.',
     }
   }
 
-  chainObservations.push({
-    id: 'chain-status',
-    label: 'Registry Status',
-    value: chainStatusValue,
-    status: chainStatusType,
-    detail: chainStatusDetail,
-  })
-
-  chainObservations.push({
-    id: 'chain-tier',
-    label: 'Identity Tier',
-    value: formatIdentityTier(resolvedTier),
-    status: resolvedTier !== null && resolvedTier !== undefined ? 'passed' : 'info',
-    detail: 'Cryptographic identity tier governance applied to this artifact.',
-  })
-
-  chainObservations.push({
-    id: 'chain-expiry',
-    label: 'Record Expiration',
-    value: formatProofExpiry(onChain?.expiresAt),
-    status: onChain?.status === 3 ? 'failed' : 'info',
-    detail: 'Expiration ledger timestamp committed to the smart contract.',
-  })
-
-  chainObservations.push({
-    id: 'chain-issuer',
-    label: 'Issuer Authority',
-    value: onChain?.issuer || 'None',
-    status: onChain?.issuer ? 'passed' : 'info',
-    detail: onChain?.issuer ? 'Stellar account address of the registering authority.' : 'No issuer address bound.',
-  })
-
-  chainObservations.push({
-    id: 'chain-source',
-    label: 'Source Address',
-    value: onChain?.source || 'None',
-    status: onChain?.source ? 'passed' : 'info',
-    detail: onChain?.source ? 'Originating publisher account address.' : 'No source account bound.',
-  })
-
-  chainObservations.push({
-    id: 'chain-events',
-    label: 'Observed Events',
-    value: offline ? 'Not queried (offline mode)' : `${events.length} event${events.length === 1 ? '' : 's'} recorded`,
-    status: offline ? 'info' : events.length > 0 ? 'passed' : 'warning',
-    detail: offline
-      ? 'Database lookup was skipped for local verification.'
-      : events.length > 0
-        ? 'NeonDB event log corroborates the artifact registration history.'
-        : 'No registration event records found for this artifact.',
-  })
-
-  // 3. Trust Reasons
-  const trustReasons: TrustReason[] = []
-
-  // Primary Trust Decision
+  // 2. Chain registration
+  let chainRegistration: TrustDimensionResult
   if (offline) {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Local Inspection Only',
-      status: 'info',
-      description:
-        'Offline local inspection: verification ran fully locally with no network calls. It inspects metadata structure and fingerprinting only and never yields a confirmed trust decision.',
-    })
-  } else if (errorCode === 'REVOKED_EVIDENCE' || onChain?.status === 2) {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Revoked Evidence Record',
-      status: 'failed',
-      description:
-        'Revoked: the chain record for this artifact has been revoked. Do not trust it as valid evidence.',
-    })
-  } else if (errorCode === 'EXPIRED_EVIDENCE' || onChain?.status === 3) {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Expired Evidence Record',
-      status: 'failed',
-      description:
-        'Expired: the chain record for this artifact has expired. Do not treat it as valid evidence.',
-    })
-  } else if (errorCode === 'METADATA_ENVELOPE_MISMATCH') {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Metadata Envelope Tampering Detected',
-      status: 'failed',
-      description:
-        'Metadata mismatch: the embedded metadata hash does not match the on-chain envelope bound to this proof. Treat this artifact as tampered with.',
-    })
-  } else if (hasHarpocratesMetadata && events.length > 0 && onChain) {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Full Corroboration Confirmed',
-      status: 'passed',
-      description:
-        'Confirmed: embedded Harpocrates metadata is corroborated by database and active chain records.',
-    })
-  } else if (hasHarpocratesMetadata) {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Metadata Corroboration Only',
-      status: 'warning',
-      description:
-        'Metadata only: embedded Harpocrates metadata lacks complete database and chain confirmation. Treat this artifact as unconfirmed.',
-    })
-  } else if (events.length > 0) {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Database Event Only',
-      status: 'warning',
-      description:
-        'Database record only: no valid embedded Harpocrates metadata or chain record was found. Treat this artifact as unconfirmed.',
-    })
+    chainRegistration = {
+      key: 'chainRegistration',
+      label: 'Chain Registration',
+      state: 'unverified',
+      code: 'OFFLINE_NOT_CHECKED',
+      summary: 'On-chain registry was not queried in offline mode.',
+    }
+  } else if (onChain) {
+    if (onChain.status === 2 || errorCode === 'REVOKED_EVIDENCE') {
+      chainRegistration = {
+        key: 'chainRegistration',
+        label: 'Chain Registration',
+        state: 'failed',
+        code: 'CHAIN_REVOKED',
+        summary: 'On-chain registry record has been revoked.',
+      }
+    } else {
+      chainRegistration = {
+        key: 'chainRegistration',
+        label: 'Chain Registration',
+        state: 'verified',
+        code: 'CHAIN_REGISTERED',
+        summary: 'Proof record is registered on the Stellar Soroban registry.',
+      }
+    }
+  } else if (errorCode === 'REVOKED_EVIDENCE') {
+    chainRegistration = {
+      key: 'chainRegistration',
+      label: 'Chain Registration',
+      state: 'failed',
+      code: 'CHAIN_REVOKED',
+      summary: 'On-chain registry record has been revoked.',
+    }
+  } else if (errorCode && CHAIN_FAILURE_CODES.has(errorCode)) {
+    chainRegistration = {
+      key: 'chainRegistration',
+      label: 'Chain Registration',
+      state: 'failed',
+      code: errorCode,
+      summary: 'Unable to confirm on-chain registration due to a verification error.',
+    }
   } else {
-    trustReasons.push({
-      id: 'primary-decision',
-      title: 'Artifact Not Verified',
-      status: 'failed',
-      description:
-        'No verification evidence found: metadata, database, and chain records did not confirm this artifact. Treat it as unverified.',
-    })
+    chainRegistration = {
+      key: 'chainRegistration',
+      label: 'Chain Registration',
+      state: 'unverified',
+      code: 'CHAIN_NOT_FOUND',
+      summary: 'No matching proof record was found on the Stellar registry.',
+    }
   }
 
-  // Evidence Fingerprint Reason
-  trustReasons.push({
-    id: 'fingerprint-integrity',
-    title: 'Cryptographic Fingerprint Integrity',
-    status: isHashValid ? 'passed' : 'failed',
-    description: isHashValid
-      ? 'The evidence hash conforms to the required 256-bit SHA-256 canonical encoding format.'
-      : 'The evidence fingerprint is either missing or contains non-canonical hex characters.',
-  })
+  // 3. Issuer trust (preserves Silent / Source / Seal tier separation)
+  let issuerTrust: TrustDimensionResult
+  if (offline) {
+    issuerTrust = {
+      key: 'issuerTrust',
+      label: 'Issuer Trust',
+      state: 'unverified',
+      code: 'OFFLINE_NOT_CHECKED',
+      summary: 'Issuer standing was not checked in offline mode.',
+    }
+  } else if (issuerRecord !== undefined && issuerRecord !== null) {
+    issuerTrust = issuerRecord.active
+      ? {
+          key: 'issuerTrust',
+          label: 'Issuer Trust',
+          state: 'verified',
+          code: 'ISSUER_ACTIVE',
+          summary: 'Institutional issuer is active in the on-chain registry.',
+        }
+      : {
+          key: 'issuerTrust',
+          label: 'Issuer Trust',
+          state: 'failed',
+          code: 'ISSUER_REVOKED',
+          summary: 'Institutional issuer has been revoked in the on-chain registry.',
+        }
+  } else if (onChain) {
+    if (onChain.tier === 0) {
+      issuerTrust = {
+        key: 'issuerTrust',
+        label: 'Issuer Trust',
+        state: 'not_applicable',
+        code: 'SILENT_TIER_NO_ISSUER',
+        summary: 'Silent tier preserves anonymous witness privacy without an issuer.',
+      }
+    } else if (onChain.tier === 1) {
+      issuerTrust = onChain.source
+        ? {
+            key: 'issuerTrust',
+            label: 'Issuer Trust',
+            state: 'verified',
+            code: 'SOURCE_ATTRIBUTED',
+            summary: 'Source tier proof is attributed to a Stellar source address.',
+          }
+        : {
+            key: 'issuerTrust',
+            label: 'Issuer Trust',
+            state: 'failed',
+            code: 'SOURCE_MISSING',
+            summary: 'Source tier proof is missing its attributed source address.',
+          }
+    } else if (onChain.tier === 2) {
+      if (!onChain.issuer) {
+        issuerTrust = {
+          key: 'issuerTrust',
+          label: 'Issuer Trust',
+          state: 'failed',
+          code: 'ISSUER_MISSING',
+          summary: 'Seal tier proof is missing an institutional issuer address.',
+        }
+      } else if (issuerRecord === null) {
+        issuerTrust = {
+          key: 'issuerTrust',
+          label: 'Issuer Trust',
+          state: 'failed',
+          code: 'ISSUER_NOT_FOUND',
+          summary: 'Institutional issuer was not found in the on-chain registry.',
+        }
+      } else {
+        issuerTrust = {
+          key: 'issuerTrust',
+          label: 'Issuer Trust',
+          state: 'unverified',
+          code: 'ISSUER_STANDING_UNCHECKED',
+          summary: 'Seal tier issuer address is present, but registry standing was not verified.',
+        }
+      }
+    } else {
+      issuerTrust = {
+        key: 'issuerTrust',
+        label: 'Issuer Trust',
+        state: 'unverified',
+        code: 'ISSUER_UNVERIFIED',
+        summary: 'Issuer trust could not be determined for this identity tier.',
+      }
+    }
+  } else {
+    issuerTrust = {
+      key: 'issuerTrust',
+      label: 'Issuer Trust',
+      state: 'unverified',
+      code: 'ISSUER_UNVERIFIED',
+      summary: 'No on-chain record is available to evaluate issuer trust.',
+    }
+  }
 
-  // Registry Corroboration Reason
-  trustReasons.push({
-    id: 'registry-consensus',
-    title: 'Stellar Soroban Consensus',
-    status: offline ? 'info' : onChain && onChain.status === 1 ? 'passed' : onChain ? 'failed' : 'warning',
-    description: offline
-      ? 'On-chain consensus verification was bypassed in offline mode.'
-      : onChain
-        ? onChain.status === 2
-          ? 'On-chain state explicitly marks this proof as revoked.'
-          : onChain.status === 3
-            ? 'On-chain state indicates this proof validity window has lapsed.'
-            : 'Stellar Soroban registry confirms active, non-revoked registration state.'
-        : 'Smart contract registry holds no registration record for this artifact.',
-  })
+  // 4. Freshness
+  let freshness: TrustDimensionResult
+  if (offline) {
+    freshness = {
+      key: 'freshness',
+      label: 'Freshness',
+      state: 'unverified',
+      code: 'OFFLINE_NOT_CHECKED',
+      summary: 'Record expiry and freshness were not checked in offline mode.',
+    }
+  } else if (errorCode === 'EXPIRED_EVIDENCE' || onChain?.status === 3) {
+    freshness = {
+      key: 'freshness',
+      label: 'Freshness',
+      state: 'failed',
+      code: 'RECORD_EXPIRED',
+      summary: 'On-chain proof record has expired.',
+    }
+  } else if (onChain) {
+    if (onChain.expiresAt === null || onChain.expiresAt === 0) {
+      freshness = {
+        key: 'freshness',
+        label: 'Freshness',
+        state: 'verified',
+        code: 'NO_EXPIRY',
+        summary: 'On-chain proof record does not expire.',
+      }
+    } else if (onChain.expiresAt <= nowUnixSeconds) {
+      freshness = {
+        key: 'freshness',
+        label: 'Freshness',
+        state: 'failed',
+        code: 'RECORD_EXPIRED',
+        summary: 'On-chain proof record has passed its expiration timestamp.',
+      }
+    } else {
+      freshness = {
+        key: 'freshness',
+        label: 'Freshness',
+        state: 'verified',
+        code: 'WITHIN_VALIDITY_WINDOW',
+        summary: 'On-chain proof record is within its active validity window.',
+      }
+    }
+  } else {
+    freshness = {
+      key: 'freshness',
+      label: 'Freshness',
+      state: 'unverified',
+      code: 'FRESHNESS_UNVERIFIED',
+      summary: 'No on-chain record is available to evaluate freshness.',
+    }
+  }
 
-  // Audit Trail Reason
-  trustReasons.push({
-    id: 'audit-trail',
-    title: 'Audit Trail Corroboration',
-    status: offline ? 'info' : events.length > 0 ? 'passed' : 'warning',
-    description: offline
-      ? 'Database audit log lookup bypassed in offline mode.'
-      : events.length > 0
-        ? `${events.length} historical NeonDB event log(s) corroborate artifact presence.`
-        : 'No historical registration events exist in the event feed.',
-  })
+  const dimensions: TrustDimensions = {
+    contentIntegrity,
+    chainRegistration,
+    issuerTrust,
+    freshness,
+  }
+
+  const dimensionList: TrustDimensionResult[] = [
+    contentIntegrity,
+    chainRegistration,
+    issuerTrust,
+    freshness,
+  ]
+
+  const failedDimensions = dimensionList
+    .filter((d) => d.state === 'failed')
+    .map((d) => d.key)
+
+  const hasFailure = failedDimensions.length > 0
+
+  let overall: OverallTrustVerdict
+  if (hasFailure) {
+    overall = 'failed'
+  } else if (
+    dimensionList.every((d) => d.state === 'verified' || d.state === 'not_applicable') &&
+    dimensionList.some((d) => d.state === 'verified')
+  ) {
+    overall = 'verified'
+  } else {
+    overall = 'incomplete'
+  }
 
   return {
-    publicInputChecks,
-    chainObservations,
-    trustReasons,
+    overall,
+    hasFailure,
+    failedDimensions,
+    dimensions,
   }
+}
+
+export type VerificationFlowOptions = {
+  signal?: AbortSignal
+  sourceAddress?: string
+  issuerRecord?: IssuerRecord | null
+  nowUnixSeconds?: number
 }
 
 /**
@@ -424,13 +523,7 @@ export function buildVerificationDetails({
  */
 export async function runVerificationFlow(
   videoHash: string,
-  options: {
-    signal?: AbortSignal
-    sourceAddress?: string
-    metadataHash?: string
-    proofId?: string
-    tier?: string
-  } = {},
+  options: VerificationFlowOptions = {},
 ): Promise<VerificationResult> {
   const safeHash = assertValidVideoHash(videoHash)
 
@@ -438,25 +531,18 @@ export async function runVerificationFlow(
   const onChain = await getOnChainProof(safeHash, options.sourceAddress)
   const hasHarpocratesMetadata = events.length > 0
 
-  const details = buildVerificationDetails({
-    videoHash: safeHash,
-    hasHarpocratesMetadata,
-    events,
-    onChain,
-    proofId: options.proofId,
-    metadataHash: options.metadataHash,
-    tier: options.tier,
-  })
-
   return {
     videoHash: safeHash,
     hasHarpocratesMetadata,
     events,
     onChain,
-    publicInputChecks: details.publicInputChecks,
-    chainObservations: details.chainObservations,
-    trustReasons: details.trustReasons,
-    details,
+    trust: buildVerificationDimensions({
+      hasHarpocratesMetadata,
+      events,
+      onChain,
+      issuerRecord: options.issuerRecord,
+      nowUnixSeconds: options.nowUnixSeconds,
+    }),
   }
 }
 
@@ -467,36 +553,22 @@ export async function runVerificationFlow(
 export async function verifyUploadedVideo(
   file: File,
   videoHash: string,
-  options: {
-    signal?: AbortSignal
-    sourceAddress?: string
-    metadataHash?: string
-    proofId?: string
-    tier?: string
-  } = {},
+  options: VerificationFlowOptions = {},
 ): Promise<VerificationResult> {
   // Validate before hitting the network at all.
   const safeHash = assertValidVideoHash(videoHash)
   const extract = await extractMetadata(file, options.signal)
   const result = await runVerificationFlow(safeHash, options)
-
   const hasHarpocratesMetadata = extract.hasHarpocratesMetadata
-  const details = buildVerificationDetails({
-    videoHash: safeHash,
-    hasHarpocratesMetadata,
-    events: result.events,
-    onChain: result.onChain,
-    proofId: options.proofId,
-    metadataHash: options.metadataHash,
-    tier: options.tier,
-  })
-
   return {
     ...result,
     hasHarpocratesMetadata,
-    publicInputChecks: details.publicInputChecks,
-    chainObservations: details.chainObservations,
-    trustReasons: details.trustReasons,
-    details,
+    trust: buildVerificationDimensions({
+      hasHarpocratesMetadata,
+      events: result.events,
+      onChain: result.onChain,
+      issuerRecord: options.issuerRecord,
+      nowUnixSeconds: options.nowUnixSeconds,
+    }),
   }
 }

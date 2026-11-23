@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { ChainProofRecord } from '../stellarTypes'
 import {
-  buildVerificationDetails,
+  buildVerificationContextKey,
+  buildVerificationDimensions,
+  createCachedVerificationEntry,
+  isVerificationContextCompatible,
+  resolveCachedVerificationResult,
   runVerificationFlow,
   verifyUploadedVideo,
+  type VerificationContextIdentity,
 } from './verificationFlow'
-import type { ChainProofRecord } from '../stellarTypes'
-import type { ProofEvent } from '../types'
 
 vi.mock('./verificationService', () => ({
   extractMetadata: vi.fn(),
@@ -13,202 +17,273 @@ vi.mock('./verificationService', () => ({
   getOnChainProof: vi.fn(),
 }))
 
-describe('verificationFlow – buildVerificationDetails', () => {
-  const VALID_HASH = 'a'.repeat(64)
-  const METADATA_HASH = 'b'.repeat(64)
-  const PROOF_ID = '0x' + 'c'.repeat(64)
+import {
+  extractMetadata,
+  fetchProofEventsByVideo,
+  getOnChainProof,
+} from './verificationService'
 
-  const ACTIVE_CHAIN_PROOF: ChainProofRecord = {
+const VALID_HASH = 'a'.repeat(64)
+
+function makeChainProof(overrides: Partial<ChainProofRecord> = {}): ChainProofRecord {
+  return {
     videoHash: VALID_HASH,
-    metadataHash: METADATA_HASH,
+    metadataHash: 'b'.repeat(64),
+    tier: 2,
     status: 1,
-    tier: 1,
-    createdAt: '1700000000',
-    expiresAt: 0,
-    issuer: 'GBISSUER',
-    source: 'GBSOURCE',
+    createdAt: '2026-01-01T00:00:00Z',
+    expiresAt: 2_000_000_000,
+    source: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF',
+    issuer: 'GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBQW2',
+    ...overrides,
   }
+}
 
-  const SAMPLE_EVENT: ProofEvent = {
-    id: 1,
-    event_type: 'registered',
-    file_name: 'test.mp4',
-    video_hash: VALID_HASH,
-    proof_id: PROOF_ID,
-    tier: 'silent',
-    created_at: '2026-10-19T00:00:00Z',
-  }
-
-  it('builds complete details for a confirmed verification result', () => {
-    const details = buildVerificationDetails({
-      videoHash: VALID_HASH,
+describe('buildVerificationDimensions', () => {
+  it('marks overall verified when all four trust dimensions pass', () => {
+    const result = buildVerificationDimensions({
       hasHarpocratesMetadata: true,
-      events: [SAMPLE_EVENT],
-      onChain: ACTIVE_CHAIN_PROOF,
-      proofId: PROOF_ID,
-      metadataHash: METADATA_HASH,
+      onChain: makeChainProof(),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+      nowUnixSeconds: 1_900_000_000,
     })
 
-    expect(details.publicInputChecks.length).toBeGreaterThanOrEqual(3)
-    const hashCheck = details.publicInputChecks.find((c) => c.id === 'video-hash')
-    expect(hashCheck?.status).toBe('passed')
-    expect(hashCheck?.value).toBe(VALID_HASH)
-
-    const metaCheck = details.publicInputChecks.find((c) => c.id === 'metadata-envelope')
-    expect(metaCheck?.status).toBe('passed')
-
-    const bindingCheck = details.publicInputChecks.find((c) => c.id === 'metadata-binding')
-    expect(bindingCheck?.status).toBe('passed')
-
-    const statusObs = details.chainObservations.find((o) => o.id === 'chain-status')
-    expect(statusObs?.status).toBe('passed')
-    expect(statusObs?.value).toContain('Confirmed')
-
-    const primaryReason = details.trustReasons.find((r) => r.id === 'primary-decision')
-    expect(primaryReason?.status).toBe('passed')
-    expect(primaryReason?.description).toMatch(/corroborated by database and active chain/i)
+    expect(result.overall).toBe('verified')
+    expect(result.hasFailure).toBe(false)
+    expect(result.failedDimensions).toEqual([])
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('verified')
   })
 
-  it('flags boundary failure when on-chain proof is revoked', () => {
-    const revokedProof: ChainProofRecord = {
-      ...ACTIVE_CHAIN_PROOF,
-      status: 2,
-    }
-
-    const details = buildVerificationDetails({
-      videoHash: VALID_HASH,
+  it('treats silent tier issuer trust as not_applicable without failing overall verdict', () => {
+    const result = buildVerificationDimensions({
       hasHarpocratesMetadata: true,
-      events: [SAMPLE_EVENT],
-      onChain: revokedProof,
-      errorCode: 'REVOKED_EVIDENCE',
+      onChain: makeChainProof({ tier: 0, issuer: null, source: null, expiresAt: 0 }),
     })
 
-    const statusObs = details.chainObservations.find((o) => o.id === 'chain-status')
-    expect(statusObs?.status).toBe('failed')
-    expect(statusObs?.value).toBe('Revoked')
-
-    const primaryReason = details.trustReasons.find((r) => r.id === 'primary-decision')
-    expect(primaryReason?.status).toBe('failed')
-    expect(primaryReason?.description).toMatch(/revoked/i)
+    expect(result.overall).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('not_applicable')
+    expect(result.dimensions.issuerTrust.code).toBe('SILENT_TIER_NO_ISSUER')
+    expect(result.dimensions.freshness.state).toBe('verified')
   })
 
-  it('flags boundary failure when on-chain proof is expired', () => {
-    const expiredProof: ChainProofRecord = {
-      ...ACTIVE_CHAIN_PROOF,
-      status: 3,
-      expiresAt: 1600000000,
-    }
-
-    const details = buildVerificationDetails({
-      videoHash: VALID_HASH,
+  it('does not let valid content, chain, and issuer mask an expired freshness failure', () => {
+    const result = buildVerificationDimensions({
       hasHarpocratesMetadata: true,
-      events: [SAMPLE_EVENT],
-      onChain: expiredProof,
-      errorCode: 'EXPIRED_EVIDENCE',
+      onChain: makeChainProof({ expiresAt: 1_800_000_000 }),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+      nowUnixSeconds: 1_900_000_000,
     })
 
-    const statusObs = details.chainObservations.find((o) => o.id === 'chain-status')
-    expect(statusObs?.status).toBe('failed')
-    expect(statusObs?.value).toBe('Expired')
-
-    const primaryReason = details.trustReasons.find((r) => r.id === 'primary-decision')
-    expect(primaryReason?.status).toBe('failed')
-    expect(primaryReason?.description).toMatch(/expired/i)
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('failed')
+    expect(result.dimensions.freshness.code).toBe('RECORD_EXPIRED')
+    expect(result.overall).toBe('failed')
+    expect(result.hasFailure).toBe(true)
+    expect(result.failedDimensions).toEqual(['freshness'])
   })
 
-  it('detects metadata envelope mismatch (tampering) boundary case', () => {
-    const details = buildVerificationDetails({
-      videoHash: VALID_HASH,
+  it('does not let valid content, chain, and freshness mask a revoked issuer failure', () => {
+    const result = buildVerificationDimensions({
       hasHarpocratesMetadata: true,
-      events: [SAMPLE_EVENT],
-      onChain: ACTIVE_CHAIN_PROOF,
-      metadataHash: 'd'.repeat(64), // Mismatch with ACTIVE_CHAIN_PROOF.metadataHash
-      errorCode: 'METADATA_ENVELOPE_MISMATCH',
+      onChain: makeChainProof(),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: false },
+      nowUnixSeconds: 1_900_000_000,
     })
 
-    const bindingCheck = details.publicInputChecks.find((c) => c.id === 'metadata-binding')
-    expect(bindingCheck?.status).toBe('failed')
-    expect(bindingCheck?.summary).toMatch(/mismatch/i)
-
-    const primaryReason = details.trustReasons.find((r) => r.id === 'primary-decision')
-    expect(primaryReason?.status).toBe('failed')
-    expect(primaryReason?.description).toMatch(/tampered/i)
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('failed')
+    expect(result.dimensions.issuerTrust.code).toBe('ISSUER_REVOKED')
+    expect(result.overall).toBe('failed')
+    expect(result.failedDimensions).toEqual(['issuerTrust'])
   })
 
-  it('handles invalid or non-hex public video hash input', () => {
-    const details = buildVerificationDetails({
-      videoHash: 'invalid-non-hex-hash',
+  it('does not let valid chain, issuer, and freshness mask a metadata envelope mismatch', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      metadataEnvelopeMismatch: true,
+      onChain: makeChainProof(),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+      nowUnixSeconds: 1_900_000_000,
     })
 
-    const hashCheck = details.publicInputChecks.find((c) => c.id === 'video-hash')
-    expect(hashCheck?.status).toBe('failed')
-    expect(hashCheck?.summary).toMatch(/malformed/i)
-
-    const fpReason = details.trustReasons.find((r) => r.id === 'fingerprint-integrity')
-    expect(fpReason?.status).toBe('failed')
+    expect(result.dimensions.contentIntegrity.state).toBe('failed')
+    expect(result.dimensions.contentIntegrity.code).toBe('METADATA_ENVELOPE_MISMATCH')
+    expect(result.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.dimensions.issuerTrust.state).toBe('verified')
+    expect(result.dimensions.freshness.state).toBe('verified')
+    expect(result.overall).toBe('failed')
+    expect(result.failedDimensions).toEqual(['contentIntegrity'])
   })
 
-  it('handles offline local verification boundary case with no network calls', () => {
-    const details = buildVerificationDetails({
-      videoHash: VALID_HASH,
+  it('does not let valid content and freshness mask a revoked chain record', () => {
+    const result = buildVerificationDimensions({
       hasHarpocratesMetadata: true,
+      onChain: makeChainProof({ status: 2, expiresAt: 0 }),
+      issuerRecord: { metadataHash: 'c'.repeat(64), active: true },
+    })
+
+    expect(result.dimensions.chainRegistration.state).toBe('failed')
+    expect(result.dimensions.chainRegistration.code).toBe('CHAIN_REVOKED')
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.overall).toBe('failed')
+    expect(result.failedDimensions).toEqual(['chainRegistration'])
+  })
+
+  it('marks network-dependent dimensions unverified in offline mode and never verified overall', () => {
+    const result = buildVerificationDimensions({
+      hasHarpocratesMetadata: true,
+      onChain: null,
       offline: true,
     })
 
-    const statusObs = details.chainObservations.find((o) => o.id === 'chain-status')
-    expect(statusObs?.value).toBe('Not checked (offline mode)')
-    expect(statusObs?.status).toBe('info')
-
-    const eventObs = details.chainObservations.find((o) => o.id === 'chain-events')
-    expect(eventObs?.value).toBe('Not queried (offline mode)')
-
-    const primaryReason = details.trustReasons.find((r) => r.id === 'primary-decision')
-    expect(primaryReason?.status).toBe('info')
-    expect(primaryReason?.description).toMatch(/offline/i)
-  })
-
-  it('handles uncorroborated or empty verification inputs safely', () => {
-    const details = buildVerificationDetails({
-      videoHash: '',
-      hasHarpocratesMetadata: false,
-    })
-
-    const hashCheck = details.publicInputChecks.find((c) => c.id === 'video-hash')
-    expect(hashCheck?.status).toBe('failed')
-
-    const primaryReason = details.trustReasons.find((r) => r.id === 'primary-decision')
-    expect(primaryReason?.status).toBe('failed')
+    expect(result.dimensions.contentIntegrity.state).toBe('verified')
+    expect(result.dimensions.chainRegistration.state).toBe('unverified')
+    expect(result.dimensions.issuerTrust.state).toBe('unverified')
+    expect(result.dimensions.freshness.state).toBe('unverified')
+    expect(result.overall).toBe('incomplete')
+    expect(result.hasFailure).toBe(false)
   })
 })
 
-describe('verificationFlow – runVerificationFlow & verifyUploadedVideo', () => {
-  const VALID_HASH = '1'.repeat(64)
-
-  it('runVerificationFlow attaches structured details to result', async () => {
-    const { fetchProofEventsByVideo, getOnChainProof } = await import('./verificationService')
-    vi.mocked(fetchProofEventsByVideo).mockResolvedValueOnce([])
-    vi.mocked(getOnChainProof).mockResolvedValueOnce(null)
+describe('runVerificationFlow & verifyUploadedVideo', () => {
+  it('returns structured trust dimensions alongside existing result fields', async () => {
+    vi.mocked(fetchProofEventsByVideo).mockResolvedValueOnce([
+      {
+        id: 1,
+        event_type: 'proof_registered',
+        file_name: 'sample.mp4',
+        video_hash: VALID_HASH,
+        proof_id: 'p'.repeat(64),
+        tier: 'source',
+        created_at: '2026-01-01T00:00:00Z',
+      },
+    ])
+    vi.mocked(getOnChainProof).mockResolvedValueOnce(
+      makeChainProof({ tier: 1, expiresAt: 0 }),
+    )
 
     const result = await runVerificationFlow(VALID_HASH)
 
     expect(result.videoHash).toBe(VALID_HASH)
-    expect(result.publicInputChecks).toBeDefined()
-    expect(result.chainObservations).toBeDefined()
-    expect(result.trustReasons).toBeDefined()
-    expect(result.details).toBeDefined()
-    expect(result.details.publicInputChecks).toEqual(result.publicInputChecks)
+    expect(result.hasHarpocratesMetadata).toBe(true)
+    expect(result.trust.overall).toBe('verified')
+    expect(result.trust.dimensions.issuerTrust.code).toBe('SOURCE_ATTRIBUTED')
   })
 
-  it('verifyUploadedVideo extracts metadata and returns full details', async () => {
-    const { extractMetadata, fetchProofEventsByVideo, getOnChainProof } = await import('./verificationService')
-    vi.mocked(extractMetadata).mockResolvedValueOnce({ hasHarpocratesMetadata: true })
+  it('recomputes trust dimensions using extracted metadata in verifyUploadedVideo', async () => {
+    vi.mocked(extractMetadata).mockResolvedValueOnce({ hasHarpocratesMetadata: false })
     vi.mocked(fetchProofEventsByVideo).mockResolvedValueOnce([])
-    vi.mocked(getOnChainProof).mockResolvedValueOnce(null)
+    vi.mocked(getOnChainProof).mockResolvedValueOnce(
+      makeChainProof({ tier: 0, expiresAt: 0 }),
+    )
 
-    const fakeFile = new File(['data'], 'test.mp4', { type: 'video/mp4' })
-    const result = await verifyUploadedVideo(fakeFile, VALID_HASH)
+    const file = new File(['synthetic'], 'synthetic.mp4', { type: 'video/mp4' })
+    const result = await verifyUploadedVideo(file, VALID_HASH)
 
-    expect(result.hasHarpocratesMetadata).toBe(true)
-    expect(result.details.publicInputChecks.find((c) => c.id === 'metadata-envelope')?.status).toBe('passed')
+    expect(result.hasHarpocratesMetadata).toBe(false)
+    expect(result.trust.dimensions.contentIntegrity.state).toBe('unverified')
+    expect(result.trust.dimensions.chainRegistration.state).toBe('verified')
+    expect(result.trust.overall).toBe('incomplete')
+  })
+})
+
+describe('cached verification context binding', () => {
+  function makeContext(
+    overrides: {
+      statement?: Partial<VerificationContextIdentity['statement']>
+      trustSnapshot?: Partial<VerificationContextIdentity['trustSnapshot']>
+    } = {},
+  ): VerificationContextIdentity {
+    return {
+      statement: {
+        videoHash: VALID_HASH,
+        proofId: 'c'.repeat(64),
+        metadataHash: 'b'.repeat(64),
+        ...overrides.statement,
+      },
+      trustSnapshot: {
+        network: 'Test SDF Network ; September 2015',
+        contractId: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+        offline: false,
+        networkMismatch: null,
+        ...overrides.trustSnapshot,
+      },
+    }
+  }
+
+  it('reuses a cached result when statement and trust snapshot identity match', () => {
+    const context = makeContext()
+    const entry = createCachedVerificationEntry(context, 'Confirmed: verified')
+
+    expect(
+      resolveCachedVerificationResult(entry, makeContext({
+        statement: { videoHash: VALID_HASH.toUpperCase() },
+      })),
+    ).toEqual({
+      usable: true,
+      result: 'Confirmed: verified',
+    })
+  })
+
+  it('rejects a cached result when statement identity changes', () => {
+    const entry = createCachedVerificationEntry(makeContext(), 'Confirmed: verified')
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ statement: { videoHash: 'd'.repeat(64) } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ statement: { proofId: 'e'.repeat(64) } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+  })
+
+  it('rejects a cached result when trust snapshot identity changes or network mismatches', () => {
+    const entry = createCachedVerificationEntry(makeContext(), 'Confirmed: verified')
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ trustSnapshot: { offline: true } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ trustSnapshot: { network: 'Public Global Stellar Network ; September 2015' } }),
+      ),
+    ).toEqual({ usable: false, reason: 'CONTEXT_CHANGED' })
+
+    expect(
+      resolveCachedVerificationResult(
+        entry,
+        makeContext({ trustSnapshot: { networkMismatch: 'Wallet is on Mainnet' } }),
+      ),
+    ).toEqual({ usable: false, reason: 'NETWORK_MISMATCH' })
+  })
+
+  it('treats missing cache or empty videoHash as incompatible', () => {
+    const emptyHashContext = makeContext({ statement: { videoHash: '   ' } })
+    expect(resolveCachedVerificationResult(null, makeContext())).toEqual({
+      usable: false,
+      reason: 'MISSING_CACHE',
+    })
+    expect(isVerificationContextCompatible(emptyHashContext, emptyHashContext)).toBe(false)
+    expect(buildVerificationContextKey(makeContext())).not.toBe(
+      buildVerificationContextKey(makeContext({ trustSnapshot: { offline: true } })),
+    )
   })
 })
