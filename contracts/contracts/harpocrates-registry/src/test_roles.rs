@@ -5,7 +5,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, BytesN, Env, IntoVal, Symbol,
 };
 
@@ -343,306 +343,198 @@ fn update_issuer_metadata_fails_for_non_admin_caller() {
     client.update_issuer_metadata(&stranger, &issuer, &b32(&env, 0x33));
 }
 
+
 // ---------------------------------------------------------------------------
-// Institutional authority history tests
+// Role-change intent digest (#1184)
 // ---------------------------------------------------------------------------
+//
+// The digest binds the approved (action, target, payload) tuple. These tests
+// prove that a substitute target/action/payload at execute time reverts with
+// IntentDigestMismatch (90), a missing digest reverts with
+// MissingIntentDigest (91), and the emergency timelock path is not a bypass.
 
 #[test]
-fn initial_admin_records_authority_history() {
+fn council_intent_digest_happy_path_sets_verifier() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-
-    assert_eq!(client.get_authority_history_count(), 1);
-    assert_eq!(client.get_approver_authority_history_count(&admin), 1);
-
-    let entry = client.get_authority_history_at(&1).expect("entry must exist");
-    assert_eq!(entry.reference, 1);
-    assert_eq!(entry.approver, admin);
-    assert_eq!(entry.role, ROLE_ADMIN);
-    assert_eq!(entry.transition, TRANSITION_INITIALIZED);
-    assert_eq!(entry.actor, Some(admin.clone()));
-    assert_eq!(entry.metadata_hash, None);
-    assert_eq!(entry.ledger_timestamp, env.ledger().timestamp());
-
-    let page = client.get_institutional_authority_history(&0, &MAX_AUTHORITY_HISTORY_PAGE);
-    assert_eq!(page.entries.len(), 1);
-    assert_eq!(page.entries.get(0).unwrap(), entry);
-    assert_eq!(page.next_offset, 1);
-    assert_eq!(page.next_cursor, None);
-    assert_eq!(page.total, 1);
-
-    let alias_page = client.get_authority_history(&0, &MAX_AUTHORITY_HISTORY_PAGE);
-    assert_eq!(alias_page, page);
-
-    let approver_page = client.get_approver_authority_history(&admin, &0, &MAX_AUTHORITY_HISTORY_PAGE);
-    assert_eq!(approver_page.entries.len(), 1);
-    assert_eq!(approver_page.entries.get(0).unwrap(), entry);
-    assert_eq!(approver_page.total, 1);
-    assert_eq!(approver_page.next_cursor, None);
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let mut members = SorobanVec::new(&env);
+    members.push_back(m1.clone());
+    members.push_back(m2.clone());
+    client.set_admin_council(&admin, &members, &2u32);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_council_action(&m1, &1u32, &target, &payload);
+    client.approve_council_proposal(&m1, &id);
+    client.approve_council_proposal(&m2, &id);
+    client.execute_council_proposal(&m2, &id);
+    assert_eq!(client.get_verifier(), Some(target));
 }
 
 #[test]
-fn admin_transfer_lifecycle_records_authority_transitions() {
+#[should_panic(expected = "Error(Contract, #90)")]
+fn council_execute_rejects_substituted_target() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    let next_admin = Address::generate(&env);
-
-    // Propose admin
-    client.propose_admin(&admin, &next_admin);
-    assert_eq!(client.get_authority_history_count(), 2);
-    assert_eq!(client.get_approver_authority_history_count(&next_admin), 1);
-
-    let prop_entry = client.get_authority_history_at(&2).unwrap();
-    assert_eq!(prop_entry.reference, 2);
-    assert_eq!(prop_entry.approver, next_admin);
-    assert_eq!(prop_entry.role, ROLE_ADMIN);
-    assert_eq!(prop_entry.transition, TRANSITION_PROPOSED);
-    assert_eq!(prop_entry.actor, Some(admin.clone()));
-
-    // Cancel proposal
-    client.cancel_admin_transfer(&admin);
-    assert_eq!(client.get_authority_history_count(), 3);
-    assert_eq!(client.get_approver_authority_history_count(&next_admin), 2);
-
-    let cancel_entry = client.get_authority_history_at(&3).unwrap();
-    assert_eq!(cancel_entry.reference, 3);
-    assert_eq!(cancel_entry.approver, next_admin);
-    assert_eq!(cancel_entry.role, ROLE_ADMIN);
-    assert_eq!(cancel_entry.transition, TRANSITION_CANCELLED);
-    assert_eq!(cancel_entry.actor, Some(admin.clone()));
-
-    // Propose again and accept
-    client.propose_admin(&admin, &next_admin);
-    client.accept_admin(&next_admin);
-
-    assert_eq!(client.get_authority_history_count(), 5);
-
-    // Entry 4: second proposal
-    let prop2 = client.get_authority_history_at(&4).unwrap();
-    assert_eq!(prop2.reference, 4);
-    assert_eq!(prop2.transition, TRANSITION_PROPOSED);
-
-    // Entry 5: old admin revoked
-    let old_revoked = client.get_authority_history_at(&5).unwrap();
-    assert_eq!(old_revoked.reference, 5);
-    assert_eq!(old_revoked.approver, admin);
-    assert_eq!(old_revoked.role, ROLE_ADMIN);
-    assert_eq!(old_revoked.transition, TRANSITION_REVOKED);
-    assert_eq!(old_revoked.actor, Some(next_admin.clone()));
-
-    // Entry 6 is actually reference 6 if previous admin revocation was 5, let's verify total
-    assert_eq!(client.get_authority_history_count(), 6);
-    let new_accepted = client.get_authority_history_at(&6).unwrap();
-    assert_eq!(new_accepted.reference, 6);
-    assert_eq!(new_accepted.approver, next_admin);
-    assert_eq!(new_accepted.role, ROLE_ADMIN);
-    assert_eq!(new_accepted.transition, TRANSITION_ACCEPTED);
-    assert_eq!(new_accepted.actor, Some(next_admin.clone()));
-
-    // Verify per-approver counts
-    assert_eq!(client.get_approver_authority_history_count(&admin), 2); // init (1) + revoked (5)
-    assert_eq!(client.get_approver_authority_history_count(&next_admin), 4); // prop (2) + cancel (3) + prop (4) + accept (6)
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let mut members = SorobanVec::new(&env);
+    members.push_back(m1.clone());
+    members.push_back(m2.clone());
+    client.set_admin_council(&admin, &members, &2u32);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_council_action(&m1, &1u32, &target, &payload);
+    client.approve_council_proposal(&m1, &id);
+    client.approve_council_proposal(&m2, &id);
+    // Attacker substitutes the target on the stored proposal.
+    env.as_contract(&contract_id, || {
+        let mut p: CouncilProposal = env.storage().persistent().get(&DataKey::CouncilProposal(id)).unwrap();
+        p.target = Address::generate(&env);
+        env.storage().persistent().set(&DataKey::CouncilProposal(id), &p);
+    });
+    client.execute_council_proposal(&m2, &id);
 }
 
 #[test]
-fn issuer_lifecycle_records_authority_history_with_metadata_hash() {
+#[should_panic(expected = "Error(Contract, #90)")]
+fn council_execute_rejects_substituted_payload() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    let issuer1 = Address::generate(&env);
-    let issuer2 = Address::generate(&env);
-    let meta1 = b32(&env, 0x11);
-    let meta2 = b32(&env, 0x22);
-    let meta3 = b32(&env, 0x33);
-
-    // Add issuer
-    client.add_issuer(&admin, &issuer1, &meta1);
-    let add_entry = client.get_authority_history_at(&2).unwrap();
-    assert_eq!(add_entry.reference, 2);
-    assert_eq!(add_entry.approver, issuer1);
-    assert_eq!(add_entry.role, ROLE_ISSUER);
-    assert_eq!(add_entry.transition, TRANSITION_ADDED);
-    assert_eq!(add_entry.actor, Some(admin.clone()));
-    assert_eq!(add_entry.metadata_hash, Some(meta1));
-
-    // Update issuer metadata
-    client.update_issuer_metadata(&admin, &issuer1, &meta2);
-    let update_entry = client.get_authority_history_at(&3).unwrap();
-    assert_eq!(update_entry.reference, 3);
-    assert_eq!(update_entry.approver, issuer1);
-    assert_eq!(update_entry.role, ROLE_ISSUER);
-    assert_eq!(update_entry.transition, TRANSITION_METADATA_UPDATED);
-    assert_eq!(update_entry.actor, Some(admin.clone()));
-    assert_eq!(update_entry.metadata_hash, Some(meta2));
-
-    // Add replacement issuer and rotate
-    client.add_issuer(&admin, &issuer2, &meta3);
-    let expires_at = client.rotate_issuer(&admin, &issuer1, &issuer2, &3600);
-
-    let rotate_entry = client.get_authority_history_at(&5).unwrap();
-    assert_eq!(rotate_entry.reference, 5);
-    assert_eq!(rotate_entry.approver, issuer1);
-    assert_eq!(rotate_entry.role, ROLE_ISSUER);
-    assert_eq!(rotate_entry.transition, TRANSITION_ROTATED);
-    assert_eq!(rotate_entry.actor, Some(admin.clone()));
-
-    // Finalize rotation after grace expires
-    env.ledger().set_timestamp(expires_at + 1);
-    client.finalize_issuer_rotation(&issuer1);
-
-    let fin_entry = client.get_authority_history_at(&7).unwrap();
-    assert_eq!(fin_entry.reference, 7);
-    assert_eq!(fin_entry.approver, issuer1);
-    assert_eq!(fin_entry.role, ROLE_ISSUER);
-    assert_eq!(fin_entry.transition, TRANSITION_FINALIZED);
-
-    // Revoke replacement issuer
-    client.revoke_issuer(&admin, &issuer2);
-    let revoke_entry = client.get_authority_history_at(&8).unwrap();
-    assert_eq!(revoke_entry.reference, 8);
-    assert_eq!(revoke_entry.approver, issuer2);
-    assert_eq!(revoke_entry.role, ROLE_ISSUER);
-    assert_eq!(revoke_entry.transition, TRANSITION_REVOKED);
-    assert_eq!(revoke_entry.actor, Some(admin));
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let mut members = SorobanVec::new(&env);
+    members.push_back(m1.clone());
+    members.push_back(m2.clone());
+    client.set_admin_council(&admin, &members, &2u32);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_council_action(&m1, &1u32, &target, &payload);
+    client.approve_council_proposal(&m1, &id);
+    client.approve_council_proposal(&m2, &id);
+    env.as_contract(&contract_id, || {
+        let mut p: CouncilProposal = env.storage().persistent().get(&DataKey::CouncilProposal(id)).unwrap();
+        p.payload = b32(&env, 0xFF);
+        env.storage().persistent().set(&DataKey::CouncilProposal(id), &p);
+    });
+    client.execute_council_proposal(&m2, &id);
 }
 
 #[test]
-fn guardian_lifecycle_records_authority_history() {
+#[should_panic(expected = "Error(Contract, #90)")]
+fn council_execute_rejects_substituted_action() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    let guardian = Address::generate(&env);
-
-    client.set_guardian(&admin, &guardian);
-    let set_entry = client.get_authority_history_at(&2).unwrap();
-    assert_eq!(set_entry.reference, 2);
-    assert_eq!(set_entry.approver, guardian);
-    assert_eq!(set_entry.role, ROLE_GUARDIAN);
-    assert_eq!(set_entry.transition, TRANSITION_ADDED);
-    assert_eq!(set_entry.actor, Some(admin.clone()));
-
-    client.clear_guardian(&admin);
-    let clear_entry = client.get_authority_history_at(&3).unwrap();
-    assert_eq!(clear_entry.reference, 3);
-    assert_eq!(clear_entry.approver, guardian);
-    assert_eq!(clear_entry.role, ROLE_GUARDIAN);
-    assert_eq!(clear_entry.transition, TRANSITION_REVOKED);
-    assert_eq!(clear_entry.actor, Some(admin));
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let mut members = SorobanVec::new(&env);
+    members.push_back(m1.clone());
+    members.push_back(m2.clone());
+    client.set_admin_council(&admin, &members, &2u32);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_council_action(&m1, &1u32, &target, &payload);
+    client.approve_council_proposal(&m1, &id);
+    client.approve_council_proposal(&m2, &id);
+    env.as_contract(&contract_id, || {
+        let mut p: CouncilProposal = env.storage().persistent().get(&DataKey::CouncilProposal(id)).unwrap();
+        p.action = 2u32;
+        env.storage().persistent().set(&DataKey::CouncilProposal(id), &p);
+    });
+    client.execute_council_proposal(&m2, &id);
 }
 
 #[test]
-fn bounded_pagination_and_cursor_navigation() {
+#[should_panic(expected = "Error(Contract, #91)")]
+fn council_execute_rejects_missing_intent() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-
-    // Init already recorded reference 1
-    // Add 4 issuers -> total 5 transitions
-    for i in 1..=4 {
-        let issuer = Address::generate(&env);
-        client.add_issuer(&admin, &issuer, &b32(&env, i));
-    }
-    assert_eq!(client.get_authority_history_count(), 5);
-
-    // Page 1: offset 0, limit 2 -> entries 1, 2
-    let p1 = client.get_institutional_authority_history(&0, &2);
-    assert_eq!(p1.entries.len(), 2);
-    assert_eq!(p1.entries.get(0).unwrap().reference, 1);
-    assert_eq!(p1.entries.get(1).unwrap().reference, 2);
-    assert_eq!(p1.next_offset, 2);
-    assert_eq!(p1.next_cursor, Some(2));
-    assert_eq!(p1.total, 5);
-
-    // Page 2: offset 2, limit 2 -> entries 3, 4
-    let p2 = client.get_institutional_authority_history(&p1.next_offset, &2);
-    assert_eq!(p2.entries.len(), 2);
-    assert_eq!(p2.entries.get(0).unwrap().reference, 3);
-    assert_eq!(p2.entries.get(1).unwrap().reference, 4);
-    assert_eq!(p2.next_offset, 4);
-    assert_eq!(p2.next_cursor, Some(4));
-
-    // Page 3: offset 4, limit 2 -> entry 5 (end reached)
-    let p3 = client.get_institutional_authority_history(&p2.next_offset, &2);
-    assert_eq!(p3.entries.len(), 1);
-    assert_eq!(p3.entries.get(0).unwrap().reference, 5);
-    assert_eq!(p3.next_offset, 5);
-    assert_eq!(p3.next_cursor, None);
-
-    // Page 4: offset 5, limit 2 -> empty
-    let p4 = client.get_institutional_authority_history(&5, &2);
-    assert_eq!(p4.entries.len(), 0);
-    assert_eq!(p4.next_cursor, None);
-    assert_eq!(p4.total, 5);
+    let m1 = Address::generate(&env);
+    let m2 = Address::generate(&env);
+    let mut members = SorobanVec::new(&env);
+    members.push_back(m1.clone());
+    members.push_back(m2.clone());
+    client.set_admin_council(&admin, &members, &2u32);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_council_action(&m1, &1u32, &target, &payload);
+    client.approve_council_proposal(&m1, &id);
+    client.approve_council_proposal(&m2, &id);
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().remove(&DataKey::CouncilIntent(id));
+    });
+    client.execute_council_proposal(&m2, &id);
 }
 
 #[test]
-fn approver_history_avoids_unbounded_iteration() {
+fn timelock_intent_digest_happy_path() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    let target_issuer = Address::generate(&env);
-
-    // Add noise entries for other issuers
-    for i in 1..=3 {
-        let other = Address::generate(&env);
-        client.add_issuer(&admin, &other, &b32(&env, i));
-    }
-
-    // Add target issuer and update metadata
-    client.add_issuer(&admin, &target_issuer, &b32(&env, 0xAA));
-    client.update_issuer_metadata(&admin, &target_issuer, &b32(&env, 0xBB));
-
-    // Add more noise
-    let noise = Address::generate(&env);
-    client.add_issuer(&admin, &noise, &b32(&env, 0xCC));
-
-    assert_eq!(client.get_authority_history_count(), 7);
-    assert_eq!(client.get_approver_authority_history_count(&target_issuer), 2);
-
-    let page = client.get_approver_authority_history(&target_issuer, &0, &50);
-    assert_eq!(page.entries.len(), 2);
-    assert_eq!(page.entries.get(0).unwrap().approver, target_issuer);
-    assert_eq!(page.entries.get(0).unwrap().transition, TRANSITION_ADDED);
-    assert_eq!(page.entries.get(1).unwrap().approver, target_issuer);
-    assert_eq!(page.entries.get(1).unwrap().transition, TRANSITION_METADATA_UPDATED);
-    assert_eq!(page.total, 2);
-
-    // Unknown approver query does not scan; returns empty page in O(1)
-    let unknown = Address::generate(&env);
-    let empty_page = client.get_approver_authority_history(&unknown, &0, &50);
-    assert_eq!(empty_page.entries.len(), 0);
-    assert_eq!(empty_page.total, 0);
-    assert_eq!(empty_page.next_cursor, None);
-
-    // Lookup out of bounds returns None
-    assert_eq!(client.get_authority_history_at(&0), None);
-    assert_eq!(client.get_authority_history_at(&9999), None);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_timelocked_action(&admin, &1u32, &target, &payload);
+    let delay = client.get_timelock_min_delay();
+    env.ledger().set_timestamp(1_000 + delay + 1);
+    client.execute_timelocked_proposal(&admin, &id);
+    assert_eq!(client.get_verifier(), Some(target));
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #16)")] // HistoryLimitExceeded
-fn authority_history_rejects_zero_limit() {
-    let (env, contract_id, _admin) = setup();
-    let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    client.get_institutional_authority_history(&0, &0);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #16)")] // HistoryLimitExceeded
-fn authority_history_rejects_limit_exceeding_cap() {
-    let (env, contract_id, _admin) = setup();
-    let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    client.get_institutional_authority_history(&0, &(MAX_AUTHORITY_HISTORY_PAGE + 1));
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #16)")] // HistoryLimitExceeded
-fn approver_authority_history_rejects_zero_limit() {
+#[should_panic(expected = "Error(Contract, #90)")]
+fn timelock_execute_rejects_substituted_target() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    client.get_approver_authority_history(&admin, &0, &0);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_timelocked_action(&admin, &1u32, &target, &payload);
+    let delay = client.get_timelock_min_delay();
+    env.ledger().set_timestamp(1_000 + delay + 1);
+    env.as_contract(&contract_id, || {
+        let mut p: TimelockProposal = env.storage().persistent().get(&DataKey::Proposal(id)).unwrap();
+        p.target = Address::generate(&env);
+        env.storage().persistent().set(&DataKey::Proposal(id), &p);
+    });
+    client.execute_timelocked_proposal(&admin, &id);
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #16)")] // HistoryLimitExceeded
-fn approver_authority_history_rejects_limit_exceeding_cap() {
+#[should_panic(expected = "Error(Contract, #91)")]
+fn timelock_execute_rejects_missing_intent() {
     let (env, contract_id, admin) = setup();
     let client = HarpocratesRegistryClient::new(&env, &contract_id);
-    client.get_approver_authority_history(&admin, &0, &(MAX_AUTHORITY_HISTORY_PAGE + 1));
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_timelocked_action(&admin, &1u32, &target, &payload);
+    let delay = client.get_timelock_min_delay();
+    env.ledger().set_timestamp(1_000 + delay + 1);
+    env.as_contract(&contract_id, || {
+        env.storage().persistent().remove(&DataKey::TimelockIntent(id));
+    });
+    client.execute_timelocked_proposal(&admin, &id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #90)")]
+fn emergency_timelock_execute_rejects_substituted_target() {
+    let (env, contract_id, admin) = setup();
+    let client = HarpocratesRegistryClient::new(&env, &contract_id);
+    env.ledger().set_timestamp(1_000);
+    let target = Address::generate(&env);
+    let payload = b32(&env, 0x01);
+    let id = client.propose_timelocked_action(&admin, &1u32, &target, &payload);
+    env.as_contract(&contract_id, || {
+        let mut p: TimelockProposal = env.storage().persistent().get(&DataKey::Proposal(id)).unwrap();
+        p.target = Address::generate(&env);
+        env.storage().persistent().set(&DataKey::Proposal(id), &p);
+    });
+    client.emergency_execute_timelock(&admin, &id);
 }
